@@ -478,6 +478,7 @@ shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
                  config->max_barriers_per_cta, config->warp_size),
       m_active_warps(0),
       m_dynamic_warp_id(0) {
+  mrf_busy_this_cycle = false; // AMK: added to constructor
   m_cluster = cluster;
   m_config = config;
   m_memory_config = mem_config;
@@ -723,7 +724,24 @@ void shader_core_stats::print(FILE *fout) const {
 
   fprintf(fout, "gpu_reg_bank_conflict_stalls = %d\n",
           gpu_reg_bank_conflict_stalls);
-
+  fprintf(fout, "mrf_reads = %llu\n", mrf_reads); // AMK: print MRF reads to output log
+  fprintf(fout, "mrf_writes = %llu\n", mrf_writes); // AMK: print MRF writes to output log
+  fprintf(fout, "mrf_bank_conflicts = %llu\n", mrf_bank_conflicts); // AMK: print MRF bankconflicts to output log
+  fprintf(fout, "mrf_port_occupancy = %llu\n", mrf_port_occupancy); // AMK: print MRF port occupancy to output log
+  fprintf(fout, "mrf_port_capacity = %llu\n", mrf_port_capacity);   // AMK: print MRF port capacity to output log
+  double mrf_port_util = (mrf_port_capacity > 0)
+        ? 100.0 * (double)mrf_port_occupancy / (double)mrf_port_capacity : 0.0;
+  fprintf(fout, "mrf_global_port_utilization = %.2f%%\n", mrf_port_util); // AMK: print MRF global port utilization to output log
+  fprintf(fout, "mrf_busy_cycle_occupancy = %llu\n", mrf_busy_cycle_occupancy); // AMK: print MRF busy port occupancy to output log
+  fprintf(fout, "mrf_busy_cycle_capacity = %llu\n", mrf_busy_cycle_capacity);   // AMK: print MRF busy port capacity to output log
+  double mrf_busy_util = (mrf_busy_cycle_capacity > 0)
+        ? 100.0 * (double)mrf_busy_cycle_occupancy / (double)mrf_busy_cycle_capacity : 0.0;
+  fprintf(fout, "mrf_busy_cycle_utilization = %.2f%%\n", mrf_busy_util); // AMK: print MRF global port utilization to output log
+  fprintf(fout, "mrf_active_cycles = %llu\n", mrf_active_cycles); // AMK: print cycles the MRF is accessed
+  fprintf(fout, "sm_active_cycles = %llu\n", sm_active_cycles);   // AMK: print cycles the SM is active
+  double mrf_active_util = (sm_active_cycles > 0)
+        ? 100.0 * (double)mrf_active_cycles / (double)sm_active_cycles : 0.0;
+  fprintf(fout, "mrf_active_cycles_percentage = %.2f%%\n", mrf_active_util); // AMK: print percentage of cycles the mrf is accessed
   fprintf(fout, "Warp Occupancy Distribution:\n");
   fprintf(fout, "Stall:%d\t", shader_cycle_distro[2]);
   fprintf(fout, "W0_Idle:%d\t", shader_cycle_distro[0]);
@@ -1711,6 +1729,11 @@ void swl_scheduler::order_warps() {
 }
 
 void shader_core_ctx::read_operands() {
+  if (get_active_warps() > 0) {  // AMK: checks if sm has active warps
+    unsigned max_ports = m_config->gpgpu_num_reg_banks * m_config->reg_file_port_throughput; // AMK: total ports 
+    inc_mrf_port_capacity(max_ports); // AMK: adds to port capacity counter
+    inc_sm_active_cycle(); // AMK: increments active SM cycle
+  }
   for (unsigned int i = 0; i < m_config->reg_file_port_throughput; ++i)
     m_operand_collector.step();
 }
@@ -3673,11 +3696,16 @@ void shader_core_config::set_pipeline_latency() {
 void shader_core_ctx::cycle() {
   if (!isactive() && get_not_completed() == 0) return;
 
+  reset_mrf_busy_cycle(); // AMK: added to reset if cycle has MRF used or not
   m_stats->shader_cycles[m_sid]++;
   writeback();
   execute();
   read_operands();
   issue();
+  // AMK: added to count cycle the MRF was used 
+  if (mrf_busy_this_cycle) {
+    inc_mrf_active_cycle(); 
+  }
   for (unsigned int i = 0; i < m_config->inst_fetch_throughput; ++i) {
     decode();
     fetch();
@@ -3691,7 +3719,8 @@ void shader_core_ctx::cache_flush() { m_ldst_unit->flush(); }
 void shader_core_ctx::cache_invalidate() { m_ldst_unit->invalidate(); }
 
 // modifiers
-std::list<opndcoll_rfu_t::op_t> opndcoll_rfu_t::arbiter_t::allocate_reads() {
+std::list<opndcoll_rfu_t::op_t> opndcoll_rfu_t::arbiter_t::allocate_reads(
+    unsigned &num_bank_conflicts, shader_core_ctx *shader) { // AMK: added for baseline stats 
   std::list<op_t>
       result;  // a list of registers that (a) are in different register banks,
                // (b) do not go to the same operand collector
@@ -3762,15 +3791,29 @@ std::list<opndcoll_rfu_t::op_t> opndcoll_rfu_t::arbiter_t::allocate_reads() {
   /// <--- end code from booksim
 
   m_last_cu = _pri;
+  num_bank_conflicts = 0; // AMK: sets bank conflicts this cycle to 0
   for (unsigned i = 0; i < m_num_banks; i++) {
+    unsigned pending_reads = m_queue[i].size(); // AMK: How many reads WANT the bank
+    unsigned granted_reads = 0;                 // AMK: How many reads GET the bank
+
     if (_inmatch[i] != -1) {
       if (!m_allocated_bank[i].is_write()) {
         unsigned bank = (unsigned)i;
         op_t &op = m_queue[bank].front();
         result.push_back(op);
         m_queue[bank].pop_front();
+        granted_reads = 1; // AMK: we successfully serviced one read
       }
     }
+    // AMK: Every pending read that wasn't granted this cycle suffered a conflict/denial
+    num_bank_conflicts += (pending_reads - granted_reads);
+  }
+  unsigned reads_granted = result.size(); // AMK: collect reads granted this cycle
+  shader->inc_mrf_port_occupancy(reads_granted); // AMK: add granted reads to port occupancy calculation
+  shader->inc_mrf_busy_port_occupancy(reads_granted); // AMK: add granted reads to port busy occupancy calculation
+  // AMK: added to mark cycle where MRF was accessed
+  if (reads_granted > 0) {
+    shader->mark_mrf_busy_cycle();
   }
 
   return result;
@@ -4229,6 +4272,7 @@ unsigned register_bank(int regnum, int wid, unsigned num_banks,
 bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
   assert(!inst.empty());
 
+  unsigned writes_granted = 0; // AMK: variable for writes granted this cycle
   std::list<unsigned> regs = m_shader->get_regs_written(inst);
   for (unsigned op = 0; op < MAX_REG_OPERANDS; op++) {
     int reg_num = inst.arch_reg.dst[op];  // this math needs to match that used
@@ -4241,11 +4285,24 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
         m_arbiter.allocate_bank_for_write(
             bank, op_t(&inst, reg_num, m_num_banks, sub_core_model,
                        m_num_banks_per_sched, inst.get_schd_id()));
+        writes_granted++;
         inst.arch_reg.dst[op] = -1;
       } else {
+        m_shader->inc_mrf_port_occupancy(writes_granted); // AMK: adding granted writes to port occupancy (on early exit path)
+        m_shader->inc_mrf_busy_port_occupancy(writes_granted); // AMK: adding granted writes to port busy occupancy (on early exit path)
+        // AMK: added to mark if MRF was used this cycle
+        if (writes_granted > 0) {
+          m_shader->mark_mrf_busy_cycle();
+        }
         return false;
       }
     }
+  }
+  m_shader->inc_mrf_port_occupancy(writes_granted); // AMK: adding granted writes to port occupancy
+  m_shader->inc_mrf_busy_port_occupancy(writes_granted); // AMK: adding granted writes to port busy occupancy (on early exit path)
+  // AMK: added to mark if MRF was used this cycle
+  if (writes_granted > 0) {
+    m_shader->mark_mrf_busy_cycle();
   }
   for (unsigned i = 0; i < (unsigned)regs.size(); i++) {
     if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
@@ -4341,7 +4398,9 @@ void opndcoll_rfu_t::allocate_cu(unsigned port_num) {
 
 void opndcoll_rfu_t::allocate_reads() {
   // process read requests that do not have conflicts
-  std::list<op_t> allocated = m_arbiter.allocate_reads();
+  unsigned bank_conflicts = 0; // AMK: added bank conflict local variable
+  std::list<op_t> allocated = m_arbiter.allocate_reads(bank_conflicts, m_shader); // AMK: passes by reference to compute bank conflicts this cycle
+  m_shader->incmrf_bank_conflicts(bank_conflicts); // AMK: calls method to add to running bank conflict counter
   std::map<unsigned, op_t> read_ops;
   for (std::list<op_t>::iterator r = allocated.begin(); r != allocated.end();
        r++) {

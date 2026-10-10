@@ -873,7 +873,7 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     }
 
     // modifiers
-    std::list<op_t> allocate_reads();
+    std::list<op_t> allocate_reads(unsigned &num_bank_conflicts, shader_core_ctx *shader); // AMK: added num_bank_conflicts as argument
 
     void add_read_requests(collector_unit_t *cu) {
       const op_t *src = cu->get_operands();
@@ -1790,6 +1790,15 @@ struct shader_core_stats_pod {
   unsigned gpu_stall_shd_mem_breakdown[N_MEM_STAGE_ACCESS_TYPE]
                                       [N_MEM_STAGE_STALL_TYPE];
   unsigned gpu_reg_bank_conflict_stalls;
+  unsigned long long mrf_reads;          // AMK: added variable for MRF reads (all SMs)
+  unsigned long long mrf_writes;         // AMK: added variable for MRF writes (all SMs)
+  unsigned long long mrf_bank_conflicts; // AMK: added varaible for MRF bank conflicts (all SMs)
+  unsigned long long mrf_port_occupancy; // AMK: added variable for MRF port occupunacy (how many reads/writes are granted)
+  unsigned long long mrf_port_capacity;  // AMK: added variable for MRF port capacity (how many read/write could be granted)
+  unsigned long long mrf_busy_cycle_occupancy; // AMK: added variable for MRF port occupancy during cycles MRF is used 
+  unsigned long long mrf_busy_cycle_capacity;  // AMK: added variable for MRF port capacity during cycles MRF is used 
+  unsigned long long mrf_active_cycles; // AMK: added variable for cycle the MRF is accessed
+  unsigned long long sm_active_cycles;  // AMK: added variable for cycles the SM has active warps on it
   unsigned *shader_cycle_distro;
   unsigned *last_shader_cycle_distro;
   unsigned *num_warps_issuable;
@@ -1983,7 +1992,30 @@ class shader_core_stats : public shader_core_stats_pod {
     free(last_shader_cycle_distro);
   }
 
-  void new_grid() {}
+  
+  void new_grid() {
+    mrf_reads = 0;          // AMK: added MRF read counter to reset per new kernel launch
+    mrf_writes = 0;         // AMK: added MRF write counter to reset per new kernel launch
+    mrf_bank_conflicts = 0; // AMK: added MRF bank conflict to reset per new kernel launch
+    mrf_port_occupancy = 0; // AMK: added MRF port occupancy to reset per new kernel launch
+    mrf_port_capacity = 0;  // AMK: added MRF port capacity to reset per new kernel launch
+    mrf_busy_cycle_occupancy = 0;
+    mrf_busy_cycle_capacity = 0;
+    mrf_active_cycles = 0;
+    sm_active_cycles = 0;
+  }
+
+  void reset_mrf_stats() {  // AMK: created function to reset MRF stats 
+    mrf_reads = 0;
+    mrf_writes = 0;
+    mrf_bank_conflicts = 0;
+    mrf_port_occupancy = 0;
+    mrf_port_capacity = 0;
+    mrf_busy_cycle_occupancy = 0;
+    mrf_busy_cycle_capacity = 0;
+    mrf_active_cycles = 0;
+    sm_active_cycles = 0;
+  }
 
   void event_warp_issued(unsigned s_id, unsigned warp_id, unsigned num_issued,
                          unsigned dynamic_warp_id);
@@ -2065,6 +2097,18 @@ class shader_core_ctx : public core_t {
                   const shader_core_config *config,
                   const memory_config *mem_config, shader_core_stats *stats);
 
+  unsigned get_active_warps() const { return m_active_warps; } // AMK: return if sm has any active warps
+
+  // AMK: added 2097-2105 to detect which cycles have MRF being accessed
+  bool mrf_busy_this_cycle;
+  void mark_mrf_busy_cycle() {
+    if (!mrf_busy_this_cycle) {
+      mrf_busy_this_cycle = true;
+      inc_mrf_busy_port_capacity(
+          m_config->gpgpu_num_reg_banks * m_config->reg_file_port_throughput);
+    }
+  }
+  void reset_mrf_busy_cycle() { mrf_busy_this_cycle = false; }
   // used by simt_core_cluster:
   // modifiers
   void cycle();
@@ -2391,11 +2435,22 @@ class shader_core_ctx : public core_t {
   void incregfile_reads(unsigned active_count) {
     m_stats->m_read_regfile_acesses[m_sid] =
         m_stats->m_read_regfile_acesses[m_sid] + active_count;
+    m_stats->mrf_reads += active_count; // AMK: increments MRF read counter 
   }
   void incregfile_writes(unsigned active_count) {
     m_stats->m_write_regfile_acesses[m_sid] =
         m_stats->m_write_regfile_acesses[m_sid] + active_count;
+    m_stats->mrf_writes += active_count; // AMK: increments MRF write counter 
   }
+  void incmrf_bank_conflicts(unsigned count) {
+    m_stats->mrf_bank_conflicts += count; // AMK: increments MRF bank conflicts counter
+  }
+  void inc_mrf_port_occupancy(unsigned count) { m_stats->mrf_port_occupancy += count; } // AMK: increments MRF port occupancy
+  void inc_mrf_port_capacity(unsigned count) { m_stats->mrf_port_capacity += count; }   // AMK: increments MRF port capacity
+  void inc_mrf_busy_port_occupancy(unsigned count) { m_stats->mrf_busy_cycle_occupancy += count; } // AMK: increments MRF port occupancy (busy cycles)
+  void inc_mrf_busy_port_capacity(unsigned count) { m_stats->mrf_busy_cycle_capacity += count; }   // AMK: increments MRF port capacity (busy cycles)
+  void inc_mrf_active_cycle() { m_stats->mrf_active_cycles++; }
+  void inc_sm_active_cycle() { m_stats->sm_active_cycles++; }
   void incnon_rf_operands(unsigned active_count) {
     m_stats->m_non_rf_operands[m_sid] =
         m_stats->m_non_rf_operands[m_sid] + active_count;

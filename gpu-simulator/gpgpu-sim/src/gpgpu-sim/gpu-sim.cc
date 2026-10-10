@@ -1254,6 +1254,7 @@ void gpgpu_sim::update_stats() {
   m_total_cta_launched = 0;
   gpu_completed_cta = 0;
   gpu_occupancy = occupancy_stats();
+  m_shader_stats->reset_mrf_stats(); // AMK: resets the MRF stats 
 }
 
 PowerscalingCoefficients *gpgpu_sim::get_scaling_coeffs() {
