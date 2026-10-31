@@ -742,6 +742,17 @@ void shader_core_stats::print(FILE *fout) const {
   double mrf_active_util = (sm_active_cycles > 0)
         ? 100.0 * (double)mrf_active_cycles / (double)sm_active_cycles : 0.0;
   fprintf(fout, "mrf_active_cycles_percentage = %.2f%%\n", mrf_active_util); // AMK: print percentage of cycles the mrf is accessed
+  fprintf(fout, "rfc_read_hits = %llu\n", rfc_read_hits); // AMK: print rfc read hits
+  fprintf(fout, "rfc_read_misses = %llu\n", rfc_read_misses); // AMK: print rfc read misses
+  fprintf(fout, "rfc_evictions = %llu\n", rfc_evictions); // AMK: print rfc evictions
+  fprintf(fout, "rfc_writes = %llu\n", rfc_writes); // AMK: print rfc writes 
+  fprintf(fout, "rfc_write_port_conflicts = %llu\n", rfc_write_port_conflicts); // AMK: print number of rfc conflicts for debug
+  fprintf(fout, "rfc_write_port_conflicts_ex_ex = %llu\n", rfc_write_port_conflicts_ex_ex);
+  fprintf(fout, "rfc_write_port_conflicts_ex_ldst = %llu\n", rfc_write_port_conflicts_ex_ldst);
+  fprintf(fout, "rfc_write_port_conflicts_ldst_ldst = %llu\n", rfc_write_port_conflicts_ldst_ldst);
+  fprintf(fout, "rfc_write_port_conflicts_ex_ex_same_inst = %llu\n", rfc_write_port_conflicts_ex_ex_same_inst);
+  fprintf(fout, "rfc_write_port_conflicts_ex_ex_diff_inst = %llu\n", rfc_write_port_conflicts_ex_ex_diff_inst);
+  fprintf(fout, "rfc_write_drops = %llu\n", rfc_write_drops);
   fprintf(fout, "Warp Occupancy Distribution:\n");
   fprintf(fout, "Stall:%d\t", shader_cycle_distro[2]);
   fprintf(fout, "W0_Idle:%d\t", shader_cycle_distro[0]);
@@ -1983,8 +1994,32 @@ void shader_core_ctx::writeback() {
      * no stalling).
      */
 
-    m_operand_collector.writeback(*pipe_reg);
+    // AMK: opndcoll_rfu_t::writeback() clears arch_reg.dst[i] to -1 in-place for each
+    // AMK: successfully allocated write bank. Capture destinations first so the RFC
+    // AMK: write loop below sees the original register numbers.
+    // int dst_regs[MAX_REG_OPERANDS];
+    // for (unsigned i = 0; i < MAX_REG_OPERANDS; i++)
+    // dst_regs[i] = pipe_reg->arch_reg.dst[i];
+
+
+    m_operand_collector.writeback(*pipe_reg, /*is_ldst=*/false);
     unsigned warp_id = pipe_reg->warp_id();
+
+    // // AMK: insert dst register into rfc 
+    // if (m_config->gpgpu_rfc_enabled) {
+    //   for (unsigned i = 0; i < MAX_REG_OPERANDS; i++) {
+    //     int reg_num = dst_regs[i];
+    //     if (reg_num >= 0) {
+    //       m_operand_collector.m_rfc[warp_id].push_back(reg_num);
+    //       incrfc_writes(m_config->warp_size); // AMK added to count rfc writes 
+    //       if (m_operand_collector.m_rfc[warp_id].size() > m_config->gpgpu_rfc_entries_per_warp) {
+    //         m_operand_collector.m_rfc[warp_id].pop_front();
+    //         incrfc_evictions(m_config->warp_size); // TODO: m_config->warp_size || pipe_reg->active_count()
+    //       }
+    //     }
+    //   }
+    // }
+
     m_scoreboard->releaseRegisters(pipe_reg);
     m_warp[warp_id]->dec_inst_in_pipeline();
     warp_inst_complete(*pipe_reg);
@@ -2724,7 +2759,7 @@ void ldst_unit::issue(register_set &reg_set) {
 void ldst_unit::writeback() {
   // process next instruction that is going to writeback
   if (!m_next_wb.empty()) {
-    if (m_operand_collector->writeback(m_next_wb)) {
+    if (m_operand_collector->writeback(m_next_wb, /*is_ldst=*/true)) {
       bool insn_completed = false;
       for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
         if (m_next_wb.out[r] > 0) {
@@ -3698,6 +3733,7 @@ void shader_core_ctx::cycle() {
 
   reset_mrf_busy_cycle(); // AMK: added to reset if cycle has MRF used or not
   m_stats->shader_cycles[m_sid]++;
+  m_operand_collector.reset_rfc_write_tracking(); // AMK: added for debuging rfc write conflicting
   writeback();
   execute();
   read_operands();
@@ -4231,6 +4267,14 @@ void opndcoll_rfu_t::init(unsigned num_banks, shader_core_ctx *shader) {
   m_num_banks = num_banks;
   m_warp_size = shader->get_config()->warp_size;
 
+  // AMK: added to resize rfc for max warps active on SM
+  if (m_shader->get_config()->gpgpu_rfc_enabled) {
+    m_rfc.resize(m_shader->get_config()->max_warps_per_shader);
+    m_rfc_writes_this_cycle.resize(m_shader->get_config()->max_warps_per_shader, 0); // AMK: added to debug conflicting rfc writes
+    m_rfc_first_write_is_ldst.resize(m_shader->get_config()->max_warps_per_shader, false);
+    m_rfc_first_write_uid.resize(m_shader->get_config()->max_warps_per_shader, 0);
+  }
+
   sub_core_model = shader->get_config()->sub_core_model;
   m_num_warp_scheds = shader->get_config()->gpgpu_num_sched_per_core;
   unsigned reg_id = 0;
@@ -4269,8 +4313,9 @@ unsigned register_bank(int regnum, int wid, unsigned num_banks,
     return bank % num_banks;
 }
 
-bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
+bool opndcoll_rfu_t::writeback(warp_inst_t &inst, bool is_ldst) {
   assert(!inst.empty());
+  const shader_core_config *config = m_shader->get_config(); // AMK: added to access the shader configuration
 
   unsigned writes_granted = 0; // AMK: variable for writes granted this cycle
   std::list<unsigned> regs = m_shader->get_regs_written(inst);
@@ -4286,6 +4331,44 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
             bank, op_t(&inst, reg_num, m_num_banks, sub_core_model,
                        m_num_banks_per_sched, inst.get_schd_id()));
         writes_granted++;
+
+        // AMK: update RFC only after this destination's MRF write is accepted.
+        if (config->gpgpu_rfc_enabled) {
+          unsigned warp_id = inst.warp_id();
+
+          if (m_rfc_writes_this_cycle[warp_id]++ > 0) {
+            // AMK: classify this dropped update against the first write.
+            m_shader->incrfc_write_port_conflicts(1);
+            m_shader->incrfc_write_port_conflict_details(
+                m_rfc_first_write_is_ldst[warp_id], is_ldst,
+                m_rfc_first_write_uid[warp_id] == inst.get_uid());
+
+            m_shader->incrfc_write_drops(config->warp_size);
+
+            // AMK: invalidate every cached copy of this destination.
+            // Validity metadata is independently clearable.
+            for (unsigned idx = 0; idx < m_rfc[warp_id].size(); idx++) {
+              if (m_rfc[warp_id][idx].reg_num ==
+                  static_cast<unsigned>(reg_num)) {
+                m_rfc[warp_id][idx].valid = false;
+              }
+            }
+          } else {
+            // AMK: first successful destination write gets the RFC port.
+            m_rfc_first_write_is_ldst[warp_id] = is_ldst;
+            m_rfc_first_write_uid[warp_id] = inst.get_uid();
+
+            m_rfc[warp_id].push_back(rfc_entry_t(reg_num, true));
+            m_shader->incrfc_writes(config->warp_size);
+
+            if (m_rfc[warp_id].size() >
+                config->gpgpu_rfc_entries_per_warp) {
+              m_rfc[warp_id].pop_front();
+              m_shader->incrfc_evictions(config->warp_size);
+            }
+          }
+        }
+
         inst.arch_reg.dst[op] = -1;
       } else {
         m_shader->inc_mrf_port_occupancy(writes_granted); // AMK: adding granted writes to port occupancy (on early exit path)
@@ -4356,6 +4439,41 @@ void opndcoll_rfu_t::dispatch_ready_cu() {
   }
 }
 
+// AMK: Moved method from shader.h to shader.cc to account for rfc 
+void opndcoll_rfu_t::arbiter_t::add_read_requests(collector_unit_t *cu, shader_core_ctx *shader, opndcoll_rfu_t *rfu) {
+  const op_t *src = cu->get_operands();
+  unsigned warp_id = cu->get_warp_id(); // (You may need cu->get_insn()->warp_id() depending on the GPGPU-Sim version)
+  for (unsigned i = 0; i < MAX_REG_OPERANDS * 2; i++) {
+    const op_t &op = src[i];
+    if (op.valid()) {
+
+      if (shader->get_config()->gpgpu_rfc_enabled) {
+        unsigned reg_num = op.get_reg();
+        bool rfc_hit = false;
+        
+        // AMK: 1. Search the RFC deque for this warp
+        for (unsigned idx = 0; idx < rfu->m_rfc[warp_id].size(); idx++) {
+          if (rfu->m_rfc[warp_id][idx].valid &&
+              rfu->m_rfc[warp_id][idx].reg_num == reg_num) {
+            rfc_hit = true;
+            break;
+          }
+        }
+        // AMK: 2. Handle the Hit / Miss
+        if (rfc_hit) {
+          cu->collect_operand(op.get_operand());
+          shader->incrfc_read_hits(shader->get_config()->warp_size); // TODO: shader->get_config()->warp_size || op.get_active_count()
+          continue;
+        } else {
+          shader->incrfc_read_misses(shader->get_config()->warp_size); // TODO: shader->get_config()->warp_size || op.get_active_count()
+        }
+      }
+      unsigned bank = op.get_bank();
+      m_queue[bank].push_back(op);
+    }
+  }
+}
+
 void opndcoll_rfu_t::allocate_cu(unsigned port_num) {
   input_port_t &inp = m_in_ports[port_num];
   for (unsigned i = 0; i < inp.m_in.size(); i++) {
@@ -4383,7 +4501,7 @@ void opndcoll_rfu_t::allocate_cu(unsigned port_num) {
           if (cu_set[k].is_free()) {
             collector_unit_t *cu = &cu_set[k];
             allocated = cu->allocate(inp.m_in[i], inp.m_out[i]);
-            m_arbiter.add_read_requests(cu);
+            m_arbiter.add_read_requests(cu, m_shader, this);
             break;
           }
         }

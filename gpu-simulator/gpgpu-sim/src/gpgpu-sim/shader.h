@@ -653,7 +653,7 @@ class opndcoll_rfu_t {  // operand collector based register file unit
   void init(unsigned num_banks, shader_core_ctx *shader);
 
   // modifiers
-  bool writeback(warp_inst_t &warp);
+  bool writeback(warp_inst_t &warp, bool is_ldst);
 
   void step() {
     dispatch_ready_cu();
@@ -673,6 +673,31 @@ class opndcoll_rfu_t {  // operand collector based register file unit
   }
 
   shader_core_ctx *shader_core() { return m_shader; }
+
+  // AMK: RFC entry contains a register ID and a valid bit.
+  struct rfc_entry_t {
+    unsigned reg_num;
+    bool valid;
+
+    rfc_entry_t(unsigned reg = 0, bool is_valid = false)
+        : reg_num(reg), valid(is_valid) {}
+  };
+
+  // AMK: register file cache data structure vector of double ended queues
+  std::vector<std::deque<rfc_entry_t>> m_rfc;
+
+  // AMK: added to debug if ld unit and ex unit writback conflict 
+  std::vector<unsigned> m_rfc_writes_this_cycle;
+  // AMK: classify later writes against the first successful write this cycle.
+  std::vector<bool> m_rfc_first_write_is_ldst;
+  std::vector<unsigned> m_rfc_first_write_uid;
+
+  // AMK: added to debug if ld unit and ex unit writback conflict
+  void reset_rfc_write_tracking() {
+    // First-write metadata is overwritten when a warp's count is zero.
+    for (auto &writes : m_rfc_writes_this_cycle)
+      writes = 0;
+  }
 
  private:
   void process_banks() { m_arbiter.reset_alloction(); }
@@ -875,16 +900,19 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     // modifiers
     std::list<op_t> allocate_reads(unsigned &num_bank_conflicts, shader_core_ctx *shader); // AMK: added num_bank_conflicts as argument
 
-    void add_read_requests(collector_unit_t *cu) {
-      const op_t *src = cu->get_operands();
-      for (unsigned i = 0; i < MAX_REG_OPERANDS * 2; i++) {
-        const op_t &op = src[i];
-        if (op.valid()) {
-          unsigned bank = op.get_bank();
-          m_queue[bank].push_back(op);
-        }
-      }
-    }
+    // void add_read_requests(collector_unit_t *cu) {
+    //   const op_t *src = cu->get_operands();
+    //   for (unsigned i = 0; i < MAX_REG_OPERANDS * 2; i++) {
+    //     const op_t &op = src[i];
+    //     if (op.valid()) {
+    //       unsigned bank = op.get_bank();
+    //       m_queue[bank].push_back(op);
+    //     }
+    //   }
+    // }
+    // AMK: moved "add_read_requests" function to main, updated to include reading from rfc
+    void add_read_requests(collector_unit_t *cu, shader_core_ctx *shader, opndcoll_rfu_t *rfu);
+
     bool bank_idle(unsigned bank) const {
       return m_allocated_bank[bank].is_free();
     }
@@ -1645,6 +1673,10 @@ class shader_core_config : public core_config {
   int gpgpu_max_insn_issue_per_warp;
   bool gpgpu_dual_issue_diff_exec_units;
 
+  // AMK: rfc flags from config
+  bool gpgpu_rfc_enabled; 
+  unsigned gpgpu_rfc_entries_per_warp;
+
   // op collector
   bool enable_specialized_operand_collector;
   int gpgpu_operand_collector_num_units_sp;
@@ -1799,6 +1831,17 @@ struct shader_core_stats_pod {
   unsigned long long mrf_busy_cycle_capacity;  // AMK: added variable for MRF port capacity during cycles MRF is used 
   unsigned long long mrf_active_cycles; // AMK: added variable for cycle the MRF is accessed
   unsigned long long sm_active_cycles;  // AMK: added variable for cycles the SM has active warps on it
+  unsigned long long rfc_read_hits; // AMK: added variable for rfc read hits
+  unsigned long long rfc_read_misses; // AMK added variable for rfc read misses
+  unsigned long long rfc_evictions; // AMK added variable for rfc evictions
+  unsigned long long rfc_writes; // AMK added variable for rfc writes (not including prefetcher writes yet)
+  unsigned long long rfc_write_port_conflicts; // AMK: added to debug rfc writes
+  unsigned long long rfc_write_port_conflicts_ex_ex;
+  unsigned long long rfc_write_port_conflicts_ex_ldst;
+  unsigned long long rfc_write_port_conflicts_ldst_ldst;
+  unsigned long long rfc_write_port_conflicts_ex_ex_same_inst;
+  unsigned long long rfc_write_port_conflicts_ex_ex_diff_inst;
+  unsigned long long rfc_write_drops;
   unsigned *shader_cycle_distro;
   unsigned *last_shader_cycle_distro;
   unsigned *num_warps_issuable;
@@ -2003,6 +2046,17 @@ class shader_core_stats : public shader_core_stats_pod {
     mrf_busy_cycle_capacity = 0;
     mrf_active_cycles = 0;
     sm_active_cycles = 0;
+    rfc_read_hits = 0;
+    rfc_read_misses = 0;
+    rfc_evictions= 0;
+    rfc_writes = 0;
+    rfc_write_port_conflicts = 0;
+    rfc_write_port_conflicts_ex_ex = 0;
+    rfc_write_port_conflicts_ex_ldst = 0;
+    rfc_write_port_conflicts_ldst_ldst = 0;
+    rfc_write_port_conflicts_ex_ex_same_inst = 0;
+    rfc_write_port_conflicts_ex_ex_diff_inst = 0;
+    rfc_write_drops = 0;
   }
 
   void reset_mrf_stats() {  // AMK: created function to reset MRF stats 
@@ -2015,6 +2069,17 @@ class shader_core_stats : public shader_core_stats_pod {
     mrf_busy_cycle_capacity = 0;
     mrf_active_cycles = 0;
     sm_active_cycles = 0;
+    rfc_read_hits = 0;
+    rfc_read_misses = 0;
+    rfc_evictions= 0;
+    rfc_writes = 0;
+    rfc_write_port_conflicts = 0;
+    rfc_write_port_conflicts_ex_ex = 0;
+    rfc_write_port_conflicts_ex_ldst = 0;
+    rfc_write_port_conflicts_ldst_ldst = 0;
+    rfc_write_port_conflicts_ex_ex_same_inst = 0;
+    rfc_write_port_conflicts_ex_ex_diff_inst = 0;
+    rfc_write_drops = 0;
   }
 
   void event_warp_issued(unsigned s_id, unsigned warp_id, unsigned num_issued,
@@ -2124,6 +2189,14 @@ class shader_core_ctx : public core_t {
                                    warp_set_t warps);
   void set_kernel(kernel_info_t *k) {
     assert(k);
+    // AMK: added to reset RFC across kernel launches (only allowed bc gpgpu_concurrent_kernel_sm = 0)
+    if (m_kernel != k)
+    {
+      for (unsigned i = 0; i < m_operand_collector.m_rfc.size(); i++)
+      {
+        m_operand_collector.m_rfc[i].clear();
+      }
+    }
     m_kernel = k;
     //        k->inc_running();
     printf("GPGPU-Sim uArch: Shader %d bind to kernel %u \'%s\'\n", m_sid,
@@ -2449,8 +2522,32 @@ class shader_core_ctx : public core_t {
   void inc_mrf_port_capacity(unsigned count) { m_stats->mrf_port_capacity += count; }   // AMK: increments MRF port capacity
   void inc_mrf_busy_port_occupancy(unsigned count) { m_stats->mrf_busy_cycle_occupancy += count; } // AMK: increments MRF port occupancy (busy cycles)
   void inc_mrf_busy_port_capacity(unsigned count) { m_stats->mrf_busy_cycle_capacity += count; }   // AMK: increments MRF port capacity (busy cycles)
-  void inc_mrf_active_cycle() { m_stats->mrf_active_cycles++; }
-  void inc_sm_active_cycle() { m_stats->sm_active_cycles++; }
+  void inc_mrf_active_cycle() { m_stats->mrf_active_cycles++; } // AMK: increments when there is a cycle with the mrf used 
+  void inc_sm_active_cycle() { m_stats->sm_active_cycles++; }   // AMK: increments when there is a cycle where an SM has a active warp
+  void incrfc_read_hits(unsigned count) { m_stats->rfc_read_hits += count; }
+  void incrfc_read_misses(unsigned count) { m_stats->rfc_read_misses += count; }
+  void incrfc_evictions(unsigned count) { m_stats->rfc_evictions += count; }
+  void incrfc_writes(unsigned count) { m_stats->rfc_writes += count; }
+  void incrfc_write_port_conflicts(unsigned count) { m_stats->rfc_write_port_conflicts += count; } // AMK: incremnents when there is rfc write conflict
+  // AMK: exactly one source pair per conflict; EX-EX also gets one subtype.
+  void incrfc_write_port_conflict_details(bool first_is_ldst, bool is_ldst,
+                                        bool same_inst) {
+    if (!first_is_ldst && !is_ldst) {
+      m_stats->rfc_write_port_conflicts_ex_ex++;
+      if (same_inst)
+        m_stats->rfc_write_port_conflicts_ex_ex_same_inst++;
+      else
+        m_stats->rfc_write_port_conflicts_ex_ex_diff_inst++;
+    } else if (first_is_ldst && is_ldst) {
+      m_stats->rfc_write_port_conflicts_ldst_ldst++;
+    } else {
+      m_stats->rfc_write_port_conflicts_ex_ldst++;
+    }
+  }
+  // AMK: count writes to RFC that are drop
+  void incrfc_write_drops(unsigned count) {
+    m_stats->rfc_write_drops += count;
+  }
   void incnon_rf_operands(unsigned active_count) {
     m_stats->m_non_rf_operands[m_sid] =
         m_stats->m_non_rf_operands[m_sid] + active_count;

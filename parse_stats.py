@@ -7,7 +7,7 @@ from pathlib import Path
 # --------------------------------------------------
 
 BASE_DIR = Path("sim_run_11.2")
-OUTPUT_FILE = Path("test_stats_10_1_26.txt")
+OUTPUT_FILE = Path("test_stats_rfcwt.txt")
 
 INTEGER = r"\d+"
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
@@ -36,6 +36,9 @@ patterns = {
     "rfc_read_hits": INTEGER,
     "rfc_read_misses": INTEGER,
     "rfc_evictions": INTEGER,
+    "rfc_writes": INTEGER,
+    "rfc_write_port_conflicts": INTEGER,
+    "rfc_write_drops": INTEGER,
     "warp_demotions": INTEGER,
     "rfc_flush_entries": INTEGER,
 }
@@ -56,6 +59,9 @@ column_names = {
     "rfc_read_hits": "RFC Hits",
     "rfc_read_misses": "RFC Misses",
     "rfc_evictions": "RFC Evict",
+    "rfc_writes": "RFC Writes",
+    "rfc_write_port_conflicts": "RFC Port Conf",
+    "rfc_write_drops": "RFC Drops",
     "warp_demotions": "Warp Dem",
     "rfc_flush_entries": "RFC Flush",
     "kernel_count": "Kernels",
