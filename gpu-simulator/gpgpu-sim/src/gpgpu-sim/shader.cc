@@ -4358,6 +4358,15 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst, bool is_ldst) {
             m_rfc_first_write_is_ldst[warp_id] = is_ldst;
             m_rfc_first_write_uid[warp_id] = inst.get_uid();
 
+            // AMK: invalidate any duplicate registers in the RFC
+            for (unsigned idx = 0; idx < m_rfc[warp_id].size(); idx++)
+            {
+              if (m_rfc[warp_id][idx].reg_num == static_cast<unsigned>(reg_num))
+              {
+                m_rfc[warp_id][idx].valid = false;
+              }
+            }
+
             m_rfc[warp_id].push_back(rfc_entry_t(reg_num, true));
             m_shader->incrfc_writes(config->warp_size);
 
