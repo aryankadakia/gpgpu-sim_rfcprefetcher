@@ -7,7 +7,7 @@ from pathlib import Path
 # --------------------------------------------------
 
 BASE_DIR = Path("sim_run_11.2")
-OUTPUT_FILE = Path("test_stats_rfcwt_2.txt")
+OUTPUT_FILE = Path("test_stats_rfcwt_3.txt")
 
 INTEGER = r"\d+"
 NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
