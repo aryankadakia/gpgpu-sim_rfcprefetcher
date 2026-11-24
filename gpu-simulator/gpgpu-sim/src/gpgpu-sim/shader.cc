@@ -979,6 +979,11 @@ void shader_core_ctx::fetch() {
         if (m_warp[warp_id]->hardware_done() &&
             !m_scoreboard->pendingWrites(warp_id) &&
             !m_warp[warp_id]->done_exit()) {
+          if (m_config->gpgpu_rfc_enabled) {                    // AMK
+            // AMK: discard RFC state belonging to this completed warp.
+            assert(warp_id < m_operand_collector.m_rfc.size()); // AMK
+            m_operand_collector.m_rfc[warp_id].clear();         // AMK
+          }
           bool did_exit = false;
           for (unsigned t = 0; t < m_config->warp_size; t++) {
             unsigned tid = warp_id * m_config->warp_size + t;
